@@ -39,10 +39,44 @@ BIN_BY_SYSTEM = {
     "MASTERCARD": "510000",
 }
 
+DEFAULT_CASHBACK_TRANSACTION = 0.00
+
+TRANSACTION_HISTORY_HEADER = (
+    "timestamp,type,from_card,to_card,amount,mcc,cashback,description"
+)
+DEPOSIT_DESCRIPTION = "{amount:.2f}₽ → карта #{card_id}"
+TRANSFER_DESCRIPTION = "{amount:.2f}₽: карта #{from_card} → карта #{to_card}"
+PAY_DESCRIPTION = "{amount:.2f}₽ (MCC: {mcc}) с карты #{card_id}"
+BALANCE_DESCRIPTION = "Баланс: {balance:.2f}₽"
+
 # =============================== ГЕНЕРАТОРЫ ДАННЫХ ===============================
 ISSUE_DATE_START = _dt.date(2022, 1, 1)
 ISSUE_DATE_GENERATOR = (ISSUE_DATE_START + _dt.timedelta(days=i) for i in _it.count())
 EXPIRY_YEARS = 4
+
+TIMESTAMP_START = _dt.datetime(2022, 1, 1, 9, 0, 0)
+
+
+def timestamp_generator():
+    for i in _it.count():
+        base_date = TIMESTAMP_START + _dt.timedelta(days=i)
+        hour = 9 + (i * 3) % 10  # цикличное смещение часа
+        minute = (i * 7) % 60  # цикличное смещение минут
+        second = (i * 11) % 60  # цикличное смещение секунд
+        yield base_date.replace(hour=hour % 24, minute=minute, second=second)
+
+
+TIMESTAMP_GENERATOR = timestamp_generator()
+
+
+def next_timestamp_after(issue_date: _dt.date) -> _dt.datetime:
+    """
+    Возвращает ближайший timestamp из генератора, который позже issue_date.
+    """
+    while True:
+        ts = next(TIMESTAMP_GENERATOR)
+        if ts.date() > issue_date:
+            return ts
 
 
 # =============================== ENUM'Ы ===============================
@@ -55,7 +89,26 @@ class CardStatus(Enum):
 CARD_STATUS = CardStatus.ACTIVE
 
 
+class TransactionType(Enum):
+    DEPOSIT = "deposit"
+    TRANSFER = "transfer"
+    PAY = "pay"
+    INTEREST = "interest"
+
+
 # ============================== ОСНОВНЫЕ КЛАССЫ ===============================
+@dataclass
+class Transaction:
+    from_card: int | None
+    to_card: int | None
+    amount: float
+    type: TransactionType
+    mcc: str | None
+    description: str
+    timestamp: _dt.datetime
+    cashback: float = DEFAULT_CASHBACK_TRANSACTION
+
+
 @dataclass
 class User:
     last_name: str
@@ -66,6 +119,10 @@ class User:
 
     accounts: list = field(default_factory=list)
     cards: list = field(default_factory=list)
+
+    def change_pin(self, old_pin: str, new_pin: str):
+        if old_pin == self.pin:
+            self.pin = new_pin
 
 
 @dataclass
@@ -110,7 +167,6 @@ class Card:
             )
 
     def get_card_info(self, fields: list = None):
-        # TODO: добавьте необходимую информацию для реализации метода
         user = self.account.owner
         data = {
             "bank_name": f"Банк:          {self.bank.name}",
@@ -142,6 +198,80 @@ class Card:
             f"Card(card_id={self.card_id}, pan={self.pan}, account={self.account}, "
             f"status={self.status}, issue_date={self.issue_date}, expiry_date={self.expiry_date})"
         )
+
+    def get_balance(self):
+        return f"Баланс: {self.account.balance:.2f}₽"
+
+    def deposit(self, amount: float):
+        self.account.balance += amount
+        timestamp = next_timestamp_after(self.issue_date)
+        tr = Transaction(
+            from_card=None,
+            to_card=self.card_id,
+            amount=amount,
+            type=TransactionType.DEPOSIT,
+            mcc=None,
+            description=f"{amount:.2f}₽ → карта #{self.card_id}",
+            timestamp=timestamp,
+        )
+        self.bank.transaction_log.append(tr)
+
+    def transfer(self, to_card, amount: float):
+        latest_issue = max(self.issue_date, to_card.issue_date)
+        timestamp = next_timestamp_after(
+            latest_issue
+        )  # для получения нужного timestamp
+        self.account.balance -= amount
+        to_card.account.balance += amount
+        tr = Transaction(
+            from_card=self.card_id,
+            to_card=to_card.card_id,
+            amount=amount,
+            type=TransactionType.TRANSFER,
+            mcc=None,
+            description=f"{amount:.2f}₽: карта #{self.card_id} → карта #{to_card.card_id}",
+            timestamp=timestamp,
+        )
+        self.bank.transaction_log.append(tr)
+
+    def pay(self, amount: float, mcc: str):
+        self.account.balance -= amount
+        timestamp = next_timestamp_after(
+            self.issue_date
+        )  # для получения нужного timestamp
+        tr = Transaction(
+            from_card=self.card_id,
+            to_card=None,
+            amount=amount,
+            type=TransactionType.PAY,
+            mcc=mcc,
+            description=f"{amount:.2f}₽ (MCC: {mcc}) с карты #{self.card_id}",
+            timestamp=timestamp,
+        )
+        self.bank.transaction_log.append(tr)
+
+    def get_transaction_history(self):
+        yield TRANSACTION_HISTORY_HEADER
+
+        for log in self.bank.transaction_log:
+            if any(map(lambda x: x == self.card_id, [log.from_card, log.to_card])):
+                amount = (
+                    f"{'+' if log.to_card == self.card_id else '-'}{log.amount:.2f}₽"
+                )
+                final_answer = [
+                    str(log.timestamp),
+                    str(log.type.value),
+                    str(log.from_card) if log.from_card is not None else "",
+                    str(log.to_card) if log.to_card is not None else "",
+                    amount,
+                    str(log.mcc) if log.mcc is not None else "",
+                    f"{log.cashback:.2f}₽",
+                    log.description,
+                ]
+                yield ",".join(final_answer)
+
+    def close(self):
+        self.status = CardStatus.CLOSED
 
 
 @dataclass
@@ -224,25 +354,20 @@ class Bank:
         user.accounts.append(acc)
         user.cards.append(card)
 
-        # TODO: реализуйте заданный метод по условию задачи
         return card
 
+    def get_global_history(self):
+        yield TRANSACTION_HISTORY_HEADER
 
-bank = Bank("Demo Bank", "044452345")
-
-card_data = [
-    ("Иванов", "Иван", "1234", "+79161234501", "MIR"),
-    ("Петров", "Пётр", "5678", "+79161234502", "VISA"),
-    ("Сидоров", "Сидор", "0000", "+79161234503", "MASTERCARD"),
-    ("Кузнецов", "Кузьма", "9999", "+79161234504", "VISA"),
-    ("Смирнов", "Сергей", "1111", "+79161234505", "MIR"),
-    ("Смирнов", "Сергей", "1111", "+79161234505", "VISA"),
-    ("Захаров", "Кирилл", "1212", "+79161234507", "MASTERCARD"),
-]
-
-cards = []
-print("Список всех выпущенных карт:\n")
-for last_name, first_name, pin, phone, system in card_data:
-    card = bank.apply_for_card(last_name, first_name, pin, phone, system)
-    print(card.get_card_info())
-    cards.append(card)
+        for log in self.transaction_log:
+            final_answer = [
+                str(log.timestamp),
+                str(log.type.value),
+                str(log.from_card) if log.from_card is not None else "",
+                str(log.to_card) if log.to_card is not None else "",
+                f"{log.amount:.2f}₽",
+                str(log.mcc) if log.mcc is not None else "",
+                f"{log.cashback:.2f}₽",
+                log.description,
+            ]
+            yield ",".join(final_answer)
