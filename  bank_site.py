@@ -40,6 +40,8 @@ BIN_BY_SYSTEM = {
 }
 
 DEFAULT_CASHBACK_TRANSACTION = 0.00
+DEBIT_DEFAULT_CASHBACK_RATE = 0.03  # кешбэк для дебитовой карты с кешбэком
+SAVING_CARD_DEFAULT_INTEREST = 0.015  # процентная ставка для накопительной карты
 
 TRANSACTION_HISTORY_HEADER = (
     "timestamp,type,from_card,to_card,amount,mcc,cashback,description"
@@ -48,6 +50,13 @@ DEPOSIT_DESCRIPTION = "{amount:.2f}₽ → карта #{card_id}"
 TRANSFER_DESCRIPTION = "{amount:.2f}₽: карта #{from_card} → карта #{to_card}"
 PAY_DESCRIPTION = "{amount:.2f}₽ (MCC: {mcc}) с карты #{card_id}"
 BALANCE_DESCRIPTION = "Баланс: {balance:.2f}₽"
+CB_DEBIT_PAY_DESCRIPTION = (
+    "{amount:.2f}₽ (MCC: {mcc}) с карты #{card_id} (кешбэк {cashback_amount:.2f}₽)"
+)
+SAVING_INTEREST_DESCRIPTION = (
+    "Начислены проценты {interest:.2f}₽ по накопительной карте #{card_id}"
+)
+
 
 # =============================== ГЕНЕРАТОРЫ ДАННЫХ ===============================
 ISSUE_DATE_START = _dt.date(2022, 1, 1)
@@ -274,6 +283,99 @@ class Card:
         self.status = CardStatus.CLOSED
 
 
+class SimpleDebitCard(Card):
+    pass
+
+
+class CashbackDebitCard(Card):
+    def __init__(
+        self,
+        account,
+        card_id,
+        payment_system=DEFAULT_PAYMENT_SYSTEM,
+        pan=EMPTY_PAN,
+        issue_date=None,
+        expiry_date=None,
+        currency=CARD_CURRENCY,
+        status=CARD_STATUS,
+        bank=None,
+        cashback_rate=DEBIT_DEFAULT_CASHBACK_RATE,
+    ):
+        super().__init__(
+            account,
+            card_id,
+            payment_system,
+            pan,
+            issue_date,
+            expiry_date,
+            currency,
+            status,
+            bank,
+        )
+        self.cashback_rate = cashback_rate
+
+    def pay(self, amount: float, mcc: str):
+        # Расчёт кешбэка (округленное произведение суммы покупки на ставку кешбэка)
+        Card.pay(self, amount, mcc)
+
+        cashback_amount = round((amount * self.cashback_rate), 2)
+
+        last_log = self.bank.transaction_log[-1]
+
+        last_log.description = f"{amount:.2f}₽ (MCC: {mcc}) с карты #{self.card_id} (кешбэк {cashback_amount:.2f}₽)"
+        last_log.cashback = cashback_amount
+
+        self.account.cashback_balance = round(
+            self.account.cashback_balance + cashback_amount, 2
+        )
+
+
+class SavingCard(Card):
+    def __init__(
+        self,
+        account,
+        card_id,
+        payment_system=DEFAULT_PAYMENT_SYSTEM,
+        pan=EMPTY_PAN,
+        issue_date=None,
+        expiry_date=None,
+        currency=CARD_CURRENCY,
+        status=CARD_STATUS,
+        bank=None,
+        interest_rate=SAVING_CARD_DEFAULT_INTEREST,
+    ):
+        super().__init__(
+            account,
+            card_id,
+            payment_system,
+            pan,
+            issue_date,
+            expiry_date,
+            currency,
+            status,
+            bank,
+        )
+        self.interest_rate = interest_rate
+
+    def accrue_interest(self):
+        interest = round((self.account.balance * self.interest_rate), 2)
+        self.account.balance += interest
+
+        timestamp = next_timestamp_after(
+            self.issue_date
+        )  # для получения нужного timestamp
+        tr = Transaction(
+            from_card=None,
+            to_card=self.card_id,
+            amount=interest,
+            type=TransactionType.INTEREST,
+            mcc=None,
+            description=f"Начислены проценты {interest:.2f}₽ по накопительной карте #{self.card_id}",
+            timestamp=timestamp,
+        )
+        self.bank.transaction_log.append(tr)
+
+
 @dataclass
 class Bank:
     name: str
@@ -342,7 +444,7 @@ class Bank:
 
         acc = Account(owner=user, acc_id=self._next_account_number())
         self.accounts[acc.acc_id] = acc
-        card = Card(
+        card = card_class(
             account=acc,
             card_id=next(self._card_seq),
             payment_system=payment_system,
@@ -371,3 +473,42 @@ class Bank:
                 log.description,
             ]
             yield ",".join(final_answer)
+
+    def issue_simple_debit_card(
+        self, last_name, first_name, pin, phone, payment_system, **kwargs
+    ):
+        return self.apply_for_card(
+            last_name,
+            first_name,
+            pin,
+            phone,
+            payment_system,
+            card_class=SimpleDebitCard,
+            **kwargs,
+        )
+
+    def issue_cashback_debit_card(
+        self, last_name, first_name, pin, phone, payment_system, **kwargs
+    ):
+        return self.apply_for_card(
+            last_name,
+            first_name,
+            pin,
+            phone,
+            payment_system,
+            card_class=CashbackDebitCard,
+            **kwargs,
+        )
+
+    def issue_saving_card(
+        self, last_name, first_name, pin, phone, payment_system, **kwargs
+    ):
+        return self.apply_for_card(
+            last_name,
+            first_name,
+            pin,
+            phone,
+            payment_system,
+            card_class=SavingCard,
+            **kwargs,
+        )
